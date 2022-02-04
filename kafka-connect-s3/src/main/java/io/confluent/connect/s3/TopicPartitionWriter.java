@@ -207,6 +207,13 @@ public class TopicPartitionWriter {
           }
       }
   }
+  public boolean isTransformedPartition() {
+    return this.isTransformedPartition;
+  }
+
+  public TopicPartition getSourceTopicPartition() {
+    return this.sourceTp;
+  }
 
   public void setSourceTopicPartition(TopicPartition tp) {
     this.sourceTp = tp;
