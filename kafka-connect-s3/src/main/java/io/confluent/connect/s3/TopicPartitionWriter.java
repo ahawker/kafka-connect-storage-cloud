@@ -220,6 +220,13 @@ public class TopicPartitionWriter {
     this.isTransformedPartition = true;
   }
 
+  public TopicPartition getPartitionToCommit(){
+    if (this.isTransformedPartition)
+      return this.sourceTp;
+    else
+      return this.tp;
+  }
+
   private enum State {
     WRITE_STARTED,
     WRITE_PARTITION_PAUSED,
