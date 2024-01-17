@@ -199,14 +199,15 @@ public class TopicPartitionWriter {
   }
 
   private void getS3Tag() {
-      hashMapTag = new HashMap<>();
-      if (extraTagKeyValuePair.size() != 0) {
-          for (int i = 0; i < extraTagKeyValuePair.size(); i++) {
-              String[] singleKv = extraTagKeyValuePair.get(i).split(":");
-              hashMapTag.put(singleKv[0], singleKv[1]);
-          }
+    hashMapTag = new HashMap<>();
+    if (extraTagKeyValuePair.size() != 0) {
+      for (int i = 0; i < extraTagKeyValuePair.size(); i++) {
+        String[] singleKv = extraTagKeyValuePair.get(i).split(":");
+        hashMapTag.put(singleKv[0], singleKv[1]);
       }
+    }
   }
+
   public boolean isTransformedPartition() {
     return this.isTransformedPartition;
   }
@@ -220,11 +221,12 @@ public class TopicPartitionWriter {
     this.isTransformedPartition = true;
   }
 
-  public TopicPartition getPartitionToCommit(){
-    if (this.isTransformedPartition)
+  public TopicPartition getPartitionToCommit() {
+    if (this.isTransformedPartition) {
       return this.sourceTp;
-    else
+    } else {
       return this.tp;
+    }
   }
 
   private enum State {
