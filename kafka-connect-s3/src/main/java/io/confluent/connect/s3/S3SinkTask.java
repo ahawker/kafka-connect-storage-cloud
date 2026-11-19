@@ -240,7 +240,7 @@ public class S3SinkTask extends SinkTask {
         continue;
       }
       
-      TopicPartitionWriter writer = getTopicPartitionWriterOrThrow(tp);
+      TopicPartitionWriter writer = getOrRegisterTopicPartitionWriter(record, tp);
       writer.buffer(record);
     }
     if (log.isDebugEnabled()) {
@@ -276,15 +276,25 @@ public class S3SinkTask extends SinkTask {
     }
   }
 
-  private void maybeRegisterSourceTopicPartition(SinkRecord record, TopicPartition tp) {
-    String originalTopic = ((InternalSinkRecord) record).originalRecord().topic();
-    Integer originalPartition = ((InternalSinkRecord) record).originalRecord().partition();
-
-    TopicPartition originalTp = new TopicPartition(originalTopic, originalPartition);
-
-    TopicPartitionWriter topicPartitionWriter = newTopicPartitionWriter(tp);
-    topicPartitionWriter.setSourceTopicPartition(originalTp);
-    topicPartitionWriters.put(tp, topicPartitionWriter);
+  // A topic-renaming SMT leaves no assigned writer for the new topic-partition.
+  // Offsets and flow control must target the source partition.
+  private TopicPartitionWriter getOrRegisterTopicPartitionWriter(
+      SinkRecord record,
+      TopicPartition tp
+  ) {
+    if (topicPartitionWriters.get(tp) == null && record instanceof InternalSinkRecord) {
+      InternalSinkRecord internal = (InternalSinkRecord) record;
+      TopicPartition source = new TopicPartition(
+          internal.originalRecord().topic(),
+          internal.originalRecord().partition()
+      );
+      if (!source.equals(tp)) {
+        TopicPartitionWriter writer = newTopicPartitionWriter(tp);
+        writer.setSourceTopicPartition(source);
+        topicPartitionWriters.put(tp, writer);
+      }
+    }
+    return getTopicPartitionWriterOrThrow(tp);
   }
 
   /**
