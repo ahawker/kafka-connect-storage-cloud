@@ -15,8 +15,8 @@
 
 package io.confluent.connect.s3;
 
-import com.amazonaws.services.s3.model.CannedAccessControlList;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -28,6 +28,7 @@ import org.easymock.EasyMock;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.powermock.api.easymock.PowerMock;
 import org.powermock.core.classloader.annotations.PowerMockIgnore;
@@ -45,8 +46,13 @@ import io.confluent.connect.s3.util.FileUtils;
 import io.confluent.connect.storage.StorageFactory;
 import io.confluent.connect.storage.partitioner.DefaultPartitioner;
 import io.confluent.connect.storage.partitioner.PartitionerConfig;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -171,7 +177,7 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
     List<SinkRecord> sinkRecords = createRecords(2);
     byte[] partialData = AvroUtils.putRecords(sinkRecords, format.getAvroData());
     String fileKey = FileUtils.fileKeyToCommit(topicsDir, getDirectory(), TOPIC_PARTITION, 0, EXTENSION, ZERO_PAD_FMT);
-    s3.putObject(S3_TEST_BUCKET_NAME, fileKey, new ByteArrayInputStream(partialData), null);
+    s3Client.putObject(PutObjectRequest.builder().bucket( S3_TEST_BUCKET_NAME).key( fileKey).build(), RequestBody.fromInputStream(new ByteArrayInputStream(partialData), partialData.length));
 
     // Accumulate rest of the records.
     sinkRecords.addAll(createRecords(5, 2));
@@ -221,6 +227,28 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
     task.start(properties);
   }
 
+  @Test
+  public void testWriteRecordsWithDigestMultipleParts() throws Exception {
+    localProps.put(S3SinkConnectorConfig.FLUSH_SIZE_CONFIG, "10000");
+    localProps.put(S3SinkConnectorConfig.SEND_DIGEST_CONFIG, "true");
+    setUp();
+
+    List<SinkRecord> sinkRecords = createRecords(11000);
+    replayAll();
+
+    task = new S3SinkTask();
+    task.initialize(context);
+    task.start(properties);
+    verifyAll();
+
+    task.put(sinkRecords);
+    task.close(context.assignment());
+    task.stop();
+
+    long[] validOffsets = {0, 10000};
+    verify(sinkRecords, validOffsets);
+  }
+
   public static class CustomPartitioner<T> extends DefaultPartitioner<T> {
     @Override
     public void configure(Map<String, Object> map) {
@@ -231,13 +259,48 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
 
   @Test
   public void testAclCannedConfig() throws Exception {
-    localProps.put(S3SinkConnectorConfig.ACL_CANNED_CONFIG, CannedAccessControlList.BucketOwnerFullControl.toString());
+    localProps.put(S3SinkConnectorConfig.ACL_CANNED_CONFIG, ObjectCannedACL.BUCKET_OWNER_FULL_CONTROL.toString());
     setUp();
     replayAll();
     task = new S3SinkTask();
     task.initialize(context);
     task.start(properties);
   }
+
+  @Test
+  public void testPutRecordWithTransformedTopicNameThrowsException() throws Exception {
+    setUp();
+    replayAll();
+    task = new S3SinkTask();
+    task.initialize(context);
+    task.start(properties);
+    verifyAll();
+
+    // Create a record with a different topic name (simulating what happens when a transform
+    // like RegexRouter modifies the topic name)
+    SinkRecord recordWithTransformedTopic = new SinkRecord(
+        "KAFKA_MAIN." + TOPIC,  // Transformed topic name
+        PARTITION,
+        Schema.STRING_SCHEMA,
+        "key",
+        Schema.STRING_SCHEMA,
+        "value",
+        0
+    );
+
+    // This should throw ConnectException due to missing TopicPartitionWriter
+    try {
+      task.put(Collections.singletonList(recordWithTransformedTopic));
+      fail("Expected ConnectException to be thrown");
+    } catch (ConnectException e) {
+      // Verify the complete error message
+      String expectedMessage = "No writer found for topic partition KAFKA_MAIN.test-topic-12. "
+          + "The record's topic-partition does not match any assigned partitions. "
+          + "Assigned partitions: [test-topic-12, test-topic-13]";
+      assertEquals("Error message should match expected format", expectedMessage, e.getMessage());
+    }
+  }
+
 
 }
 
