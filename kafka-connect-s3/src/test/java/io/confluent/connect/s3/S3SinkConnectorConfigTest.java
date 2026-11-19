@@ -15,9 +15,6 @@
 
 package io.confluent.connect.s3;
 
-import com.amazonaws.ClientConfiguration;
-import com.amazonaws.auth.AWSCredentialsProvider;
-
 import io.confluent.connect.s3.format.bytearray.ByteArrayFormat;
 import io.confluent.connect.s3.format.parquet.ParquetFormat;
 
@@ -27,6 +24,9 @@ import org.apache.kafka.connect.json.DecimalFormat;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.After;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+
 import org.junit.Before;
 import org.junit.Test;
 
@@ -55,10 +55,15 @@ import io.confluent.connect.avro.AvroDataConfig;
 import static io.confluent.connect.s3.S3SinkConnectorConfig.AffixType;
 import static io.confluent.connect.s3.S3SinkConnectorConfig.DECIMAL_FORMAT_CONFIG;
 import static io.confluent.connect.s3.S3SinkConnectorConfig.DECIMAL_FORMAT_DEFAULT;
+import static io.confluent.connect.s3.S3SinkConnectorConfig.ENABLE_CONDITIONAL_WRITES_CONFIG;
 import static io.confluent.connect.s3.S3SinkConnectorConfig.HEADERS_FORMAT_CLASS_CONFIG;
 import static io.confluent.connect.s3.S3SinkConnectorConfig.KEYS_FORMAT_CLASS_CONFIG;
 import static io.confluent.connect.s3.S3SinkConnectorConfig.SCHEMA_PARTITION_AFFIX_TYPE_CONFIG;
 
+import static io.confluent.connect.s3.S3SinkConnectorConfig.SEND_DIGEST_CONFIG;
+import static io.confluent.connect.s3.S3SinkConnectorConfig.STORE_KAFKA_HEADERS_CONFIG;
+import static io.confluent.connect.s3.S3SinkConnectorConfig.STORE_KAFKA_KEYS_CONFIG;
+import static io.confluent.connect.storage.StorageSinkConnectorConfig.ROTATE_SCHEDULE_INTERVAL_MS_CONFIG;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
@@ -231,10 +236,10 @@ public class S3SinkConnectorConfigTest extends S3SinkConnectorTestBase {
     );
     connectorConfig = new S3SinkConnectorConfig(properties);
 
-    AWSCredentialsProvider credentialsProvider = connectorConfig.getCredentialsProvider();
+    AwsCredentialsProvider credentialsProvider = connectorConfig.getCredentialsProvider();
 
-    assertEquals(ACCESS_KEY_VALUE, credentialsProvider.getCredentials().getAWSAccessKeyId());
-    assertEquals(SECRET_KEY_VALUE, credentialsProvider.getCredentials().getAWSSecretKey());
+    assertEquals(ACCESS_KEY_VALUE, credentialsProvider.resolveCredentials().accessKeyId());
+    assertEquals(SECRET_KEY_VALUE, credentialsProvider.resolveCredentials().secretAccessKey());
   }
 
   @Test
@@ -260,23 +265,6 @@ public class S3SinkConnectorConfigTest extends S3SinkConnectorTestBase {
 
     AwsAssumeRoleCredentialsProvider credentialsProvider =
         (AwsAssumeRoleCredentialsProvider) connectorConfig.getCredentialsProvider();
-  }
-
-  @Test
-  public void testUseExpectContinueDefault() throws Exception {
-    setUp();
-    S3Storage storage = new S3Storage(connectorConfig, url, S3_TEST_BUCKET_NAME, null);
-    ClientConfiguration clientConfig = storage.newClientConfiguration(connectorConfig);
-    assertEquals(true, clientConfig.isUseExpectContinue());
-  }
-
-  @Test
-  public void testUseExpectContinueFalse() throws Exception {
-    localProps.put(S3SinkConnectorConfig.HEADERS_USE_EXPECT_CONTINUE_CONFIG, "false");
-    setUp();
-    S3Storage storage = new S3Storage(connectorConfig, url, S3_TEST_BUCKET_NAME, null);
-    ClientConfiguration clientConfig = storage.newClientConfiguration(connectorConfig);
-    assertEquals(false, clientConfig.isUseExpectContinue());
   }
 
   @Test
@@ -638,6 +626,60 @@ public class S3SinkConnectorConfigTest extends S3SinkConnectorTestBase {
   public void testSchemaPartitionerAffixTypeExceptionOnWrongValue() {
     properties.put(SCHEMA_PARTITION_AFFIX_TYPE_CONFIG, "Random");
     new S3SinkConnectorConfig(properties);
+  }
+
+  @Test
+  public void testSendDigestConfigDefault() {
+    properties.remove(SEND_DIGEST_CONFIG);
+    connectorConfig = new S3SinkConnectorConfig(properties);
+    assertFalse(connectorConfig.isSendDigestEnabled());
+  }
+
+  @Test
+  public void testSendDigestConfig() {
+    properties.put(SEND_DIGEST_CONFIG, "true");
+    connectorConfig = new S3SinkConnectorConfig(properties);
+    assertTrue(connectorConfig.isSendDigestEnabled());
+
+    properties.put(SEND_DIGEST_CONFIG, "false");
+    connectorConfig = new S3SinkConnectorConfig(properties);
+    assertFalse(connectorConfig.isSendDigestEnabled());
+  }
+
+  @Test(expected = ConfigException.class)
+  public void testSendDigestConfigOnWrongValue() {
+    properties.put(SEND_DIGEST_CONFIG, "Random");
+    new S3SinkConnectorConfig(properties);
+  }
+
+  @Test
+  public void testConditionalWritesEnabledConfig() {
+
+    // Default false -> since scheduled rotation is not enabled
+    assertFalse(new S3SinkConnectorConfig(properties).shouldEnableConditionalWrites());
+
+    // Should return false, because scheduled rotation is not enabled
+    properties.put(ENABLE_CONDITIONAL_WRITES_CONFIG, "true");
+    assertFalse(new S3SinkConnectorConfig(properties).shouldEnableConditionalWrites());
+
+    // Both scheduled rotation and conditional write enabled
+    properties.put(ROTATE_SCHEDULE_INTERVAL_MS_CONFIG, "100");
+    assertTrue(new S3SinkConnectorConfig(properties).shouldEnableConditionalWrites());
+
+    // Both scheduled rotation and conditional write enabled. But, returns false because store kafka headers is enabled
+    properties.put(STORE_KAFKA_HEADERS_CONFIG, "true");
+    assertFalse(new S3SinkConnectorConfig(properties).shouldEnableConditionalWrites());
+
+    // Both scheduled rotation and conditional write enabled. But, returns false because store kafka keys is enabled
+    properties.put(STORE_KAFKA_HEADERS_CONFIG, "false");
+    properties.put(STORE_KAFKA_KEYS_CONFIG, "true");
+    assertFalse(new S3SinkConnectorConfig(properties).shouldEnableConditionalWrites());
+
+    // Conditional write disabled, but scheduled rotation enabled
+    properties.put(ENABLE_CONDITIONAL_WRITES_CONFIG, "false");
+    properties.remove(STORE_KAFKA_HEADERS_CONFIG);
+    properties.remove(STORE_KAFKA_KEYS_CONFIG);
+    assertFalse(new S3SinkConnectorConfig(properties).shouldEnableConditionalWrites());
   }
 }
 
