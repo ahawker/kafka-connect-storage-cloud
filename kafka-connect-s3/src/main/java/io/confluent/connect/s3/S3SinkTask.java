@@ -264,16 +264,25 @@ public class S3SinkTask extends SinkTask {
         }
       } catch (RetriableException e) {
         log.error("Exception on topic partition {}: ", tp, e);
-        Long currentStartOffset = writer.currentStartOffset();
-        if (currentStartOffset != null) {
-          context.offset(tp, currentStartOffset);
-        }
-        context.timeout(timeoutMs);
-        writer = newTopicPartitionWriter(tp);
-        writer.failureTime(time.milliseconds());
-        topicPartitionWriters.put(tp, writer);
+        handleRetriableWriteFailure(tp);
       }
     }
+  }
+
+  void handleRetriableWriteFailure(TopicPartition tp) {
+    TopicPartitionWriter failed = topicPartitionWriters.get(tp);
+    Long currentStartOffset = failed.currentStartOffset();
+    if (currentStartOffset != null) {
+      // The consumer owns the source partition, not the transformed one.
+      context.offset(failed.getPartitionToCommit(), currentStartOffset);
+    }
+    context.timeout(timeoutMs);
+    TopicPartitionWriter replacement = newTopicPartitionWriter(tp);
+    if (failed.isTransformedPartition()) {
+      replacement.setSourceTopicPartition(failed.getSourceTopicPartition());
+    }
+    replacement.failureTime(time.milliseconds());
+    topicPartitionWriters.put(tp, replacement);
   }
 
   // A topic-renaming SMT leaves no assigned writer for the new topic-partition.

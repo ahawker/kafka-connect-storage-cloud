@@ -58,6 +58,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -424,5 +426,41 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
 
     Mockito.verify(reporter, times(1)).report(any(), any(DataException.class));
     assertTrue(offsets.isEmpty());
+  }
+
+  @Test
+  public void testRetriableFailureOnRenamedPartitionRewindsSourcePartition() throws Exception {
+    setUp();
+    replayAll();
+    SinkTaskContext mockContext = startTaskWithMockContext(null);
+    task.put(createRenamedRecords(2, RENAMED_TOPIC));
+
+    task.handleRetriableWriteFailure(new TopicPartition(RENAMED_TOPIC, PARTITION));
+    task.stop();
+
+    Mockito.verify(mockContext).offset(eq(new TopicPartition(TOPIC, PARTITION)), anyLong());
+    Mockito.verify(mockContext, never())
+        .offset(eq(new TopicPartition(RENAMED_TOPIC, PARTITION)), anyLong());
+  }
+
+  @Test
+  public void testRetriableFailureKeepsSourcePartitionOnReplacementWriter() throws Exception {
+    setUp();
+    replayAll();
+    // Replacement writer skips writes until the backoff passes.
+    properties.put(S3SinkConnectorConfig.RETRY_BACKOFF_CONFIG, "1");
+    startTaskWithMockContext(null);
+    task.put(createRenamedRecords(2, RENAMED_TOPIC));
+
+    task.handleRetriableWriteFailure(new TopicPartition(RENAMED_TOPIC, PARTITION));
+    Thread.sleep(50);
+    task.put(createRenamedRecords(3, RENAMED_TOPIC));
+    Map<TopicPartition, OffsetAndMetadata> offsets = task.preCommit(Collections.emptyMap());
+    task.stop();
+
+    assertEquals(
+        Collections.singleton(new TopicPartition(TOPIC, PARTITION)),
+        offsets.keySet()
+    );
   }
 }
