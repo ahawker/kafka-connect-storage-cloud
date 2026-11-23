@@ -15,7 +15,6 @@
 
 package io.confluent.connect.s3;
 
-import com.amazonaws.AmazonClientException;
 import io.confluent.connect.s3.S3SinkConnectorConfig.OutputWriteBehavior;
 import io.confluent.connect.s3.util.TombstoneSupportedPartitioner;
 import io.confluent.connect.s3.util.SchemaPartitioner;
@@ -24,17 +23,20 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
-import org.apache.kafka.connect.runtime.InternalSinkRecord;
 import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.core.exception.SdkException;
 
 import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import io.confluent.common.utils.SystemTime;
@@ -139,7 +141,7 @@ public class S3SinkTask extends SinkTask {
     } catch (ClassNotFoundException | IllegalAccessException | InstantiationException
         | InvocationTargetException | NoSuchMethodException e) {
       throw new ConnectException("Reflection exception: ", e);
-    } catch (AmazonClientException e) {
+    } catch (SdkException e) {
       throw new ConnectException(e);
     }
   }
@@ -225,31 +227,34 @@ public class S3SinkTask extends SinkTask {
 
   @Override
   public void put(Collection<SinkRecord> records) throws ConnectException {
+    long putStartTime = time.milliseconds();
+
     for (SinkRecord record : records) {
       String topic = record.topic();
       int partition = record.kafkaPartition();
       TopicPartition tp = new TopicPartition(topic, partition);
 
       if (maybeSkipOnNullValue(record)) {
-        if (reporter != null) {
-          reporter.report(record, new DataException("Skipping null value record."));
-        }
+        maybeReportNullRecordToDlq(record);
         continue;
       }
-      if (topicPartitionWriters.get(tp) == null) {
-        // We'll attempt to register extract and store the source partition and partition
-        // in case a transformer props was declared
-        maybeRegisterSourceTopicPartition(record, tp);
-      }
-      topicPartitionWriters.get(tp).buffer(record);
+      
+      TopicPartitionWriter writer = getOrRegisterTopicPartitionWriter(record, tp);
+      writer.buffer(record);
     }
     if (log.isDebugEnabled()) {
       log.debug("Read {} records from Kafka", records.size());
     }
 
-    for (TopicPartition tp : topicPartitionWriters.keySet()) {
+    //shuffle the topic partitions as otherwise the last topic partition will
+    //always get the least amount of time to write
+    List<TopicPartition> shuffledList = new ArrayList<>(topicPartitionWriters.keySet());
+    Collections.shuffle(shuffledList);
+
+    for (TopicPartition tp : shuffledList) {
       TopicPartitionWriter writer = topicPartitionWriters.get(tp);
       try {
+        writer.setWriteDeadline(putStartTime);
         writer.write();
         if (log.isDebugEnabled()) {
           log.debug("TopicPartition: {}, SchemaCompatibility:{}, FileRotations: {}",
@@ -258,27 +263,84 @@ public class S3SinkTask extends SinkTask {
         }
       } catch (RetriableException e) {
         log.error("Exception on topic partition {}: ", tp, e);
-        Long currentStartOffset = writer.currentStartOffset();
-        if (currentStartOffset != null) {
-          context.offset(tp, currentStartOffset);
-        }
-        context.timeout(timeoutMs);
-        writer = newTopicPartitionWriter(tp);
-        writer.failureTime(time.milliseconds());
-        topicPartitionWriters.put(tp, writer);
+        handleRetriableWriteFailure(tp);
       }
     }
   }
 
-  private void maybeRegisterSourceTopicPartition(SinkRecord record, TopicPartition tp) {
-    String originalTopic = ((InternalSinkRecord) record).originalRecord().topic();
-    Integer originalPartition = ((InternalSinkRecord) record).originalRecord().partition();
+  void handleRetriableWriteFailure(TopicPartition tp) {
+    TopicPartitionWriter failed = topicPartitionWriters.get(tp);
+    Long currentStartOffset = failed.currentStartOffset();
+    if (currentStartOffset != null) {
+      // The consumer owns the source partition, not the transformed one.
+      context.offset(failed.getPartitionToCommit(), currentStartOffset);
+    }
+    context.timeout(timeoutMs);
+    TopicPartitionWriter replacement = newTopicPartitionWriter(tp);
+    if (failed.isTransformedPartition()) {
+      replacement.setSourceTopicPartition(failed.getSourceTopicPartition());
+    }
+    replacement.failureTime(time.milliseconds());
+    topicPartitionWriters.put(tp, replacement);
+  }
 
-    TopicPartition originalTp = new TopicPartition(originalTopic, originalPartition);
+  // A topic-renaming SMT leaves no assigned writer for the new topic-partition.
+  // Offsets and flow control must target the source partition.
+  private TopicPartitionWriter getOrRegisterTopicPartitionWriter(
+      SinkRecord record,
+      TopicPartition tp
+  ) {
+    if (topicPartitionWriters.get(tp) == null) {
+      // Public since Kafka 3.6. The runtime-internal InternalSinkRecord changed in Kafka 4.0.
+      String originalTopic = record.originalTopic();
+      Integer originalPartition = record.originalKafkaPartition();
+      if (originalTopic != null && originalPartition != null) {
+        TopicPartition source = new TopicPartition(originalTopic, originalPartition);
+        if (!source.equals(tp)) {
+          TopicPartitionWriter writer = newTopicPartitionWriter(tp);
+          writer.setSourceTopicPartition(source);
+          topicPartitionWriters.put(tp, writer);
+        }
+      }
+    }
+    return getTopicPartitionWriterOrThrow(tp);
+  }
 
-    TopicPartitionWriter topicPartitionWriter = newTopicPartitionWriter(tp);
-    topicPartitionWriter.setSourceTopicPartition(originalTp);
-    topicPartitionWriters.put(tp, topicPartitionWriter);
+  /**
+   * Retrieves the TopicPartitionWriter for the given TopicPartition.
+   * If no writer is found, it indicates a mismatch between the record's topic partition
+   * and the assigned partitions.
+   *
+   * @param tp the TopicPartition to get the writer for
+   * @return the TopicPartitionWriter
+   * @throws ConnectException if no writer is found
+   */
+  private TopicPartitionWriter getTopicPartitionWriterOrThrow(TopicPartition tp)
+      throws ConnectException {
+    TopicPartitionWriter writer = topicPartitionWriters.get(tp);
+    if (writer == null) {
+      String errorMsg = String.format(
+          "No writer found for topic partition %s. "
+              + "The record's topic-partition does not match any assigned partitions. "
+              + "Assigned partitions: %s",
+          tp,
+          topicPartitionWriters.keySet()
+      );
+      log.error(errorMsg);
+      throw new ConnectException(errorMsg);
+    }
+    return writer;
+  }
+
+  /**
+   * Reports a null-valued record to the Dead Letter Queue if configured.
+   *
+   * @param record the SinkRecord with null value to report
+   */
+  private void maybeReportNullRecordToDlq(SinkRecord record) {
+    if (reporter != null && connectorConfig.reportNullRecordsToDlq()) {
+      reporter.report(record, new DataException("Skipping null value record."));
+    }
   }
 
   private boolean maybeSkipOnNullValue(SinkRecord record) {

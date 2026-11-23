@@ -15,15 +15,12 @@
 
 package io.confluent.connect.s3;
 
-import com.amazonaws.ClientConfiguration;
-import com.amazonaws.auth.AWSCredentialsProvider;
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
-import com.amazonaws.regions.RegionUtils;
-import com.amazonaws.regions.Regions;
-import com.amazonaws.services.s3.model.CannedAccessControlList;
-import com.amazonaws.services.s3.model.SSEAlgorithm;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import io.confluent.connect.storage.common.util.StringUtils;
 import org.apache.kafka.common.Configurable;
 import org.apache.kafka.common.config.AbstractConfig;
@@ -34,11 +31,13 @@ import org.apache.kafka.common.config.ConfigDef.Validator;
 import org.apache.kafka.common.config.ConfigDef.Width;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.config.types.Password;
-import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.json.DecimalFormat;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -50,7 +49,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -74,6 +72,7 @@ import io.confluent.connect.storage.partitioner.FieldPartitioner;
 import io.confluent.connect.storage.partitioner.HourlyPartitioner;
 import io.confluent.connect.storage.partitioner.PartitionerConfig;
 import io.confluent.connect.storage.partitioner.TimeBasedPartitioner;
+import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 
 import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
 
@@ -107,9 +106,19 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   public static final String WAN_MODE_CONFIG = "s3.wan.mode";
   private static final boolean WAN_MODE_DEFAULT = false;
 
+  public static final String ENABLE_CONDITIONAL_WRITES_CONFIG = "enable.conditional.writes";
+  private static final boolean ENABLE_CONDITIONAL_WRITES_DEFAULT = true;
+  private static final String ENABLE_CONDITIONAL_WRITES_DOC = "Flag to control whether to enable "
+      + "conditional writes during multipart upload. The config will be ignored if scheduled "
+      + "rotation is disabled by setting `rotate.schedule.interval.ms` to -1 or the connector is "
+      + "configured to write kafka keys or headers to S3";
+
+  public static final String MAX_FILE_SCAN_LIMIT_CONFIG = "max.files.scan.limit";
+  private static final String MAX_FILE_SCAN_LIMIT_DEFAULT = "100";
+
   public static final String CREDENTIALS_PROVIDER_CLASS_CONFIG = "s3.credentials.provider.class";
-  public static final Class<? extends AWSCredentialsProvider> CREDENTIALS_PROVIDER_CLASS_DEFAULT =
-      DefaultAWSCredentialsProviderChain.class;
+  public static final Class<? extends AwsCredentialsProvider> CREDENTIALS_PROVIDER_CLASS_DEFAULT =
+      DefaultCredentialsProvider.class;
   /**
    * The properties that begin with this prefix will be used to configure a class, specified by
    * {@code s3.credentials.provider.class} if it implements {@link Configurable}.
@@ -127,13 +136,16 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   public static final Password AWS_SECRET_ACCESS_KEY_DEFAULT = new Password(null);
 
   public static final String REGION_CONFIG = "s3.region";
-  public static final String REGION_DEFAULT = Regions.DEFAULT_REGION.getName();
+  public static final String REGION_DEFAULT =  Region.US_WEST_2.id();
 
   public static final String ACL_CANNED_CONFIG = "s3.acl.canned";
   public static final String ACL_CANNED_DEFAULT = null;
 
   public static final String COMPRESSION_TYPE_CONFIG = "s3.compression.type";
   public static final String COMPRESSION_TYPE_DEFAULT = "none";
+
+  public static final String SEND_DIGEST_CONFIG = "s3.send.digest";
+  public static final boolean SEND_DIGEST_DEFAULT = false;
 
   public static final String COMPRESSION_LEVEL_CONFIG = "s3.compression.level";
   public static final int COMPRESSION_LEVEL_DEFAULT = Deflater.DEFAULT_COMPRESSION;
@@ -161,15 +173,37 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   public static final String HEADERS_USE_EXPECT_CONTINUE_CONFIG =
       "s3.http.send.expect.continue";
   public static final boolean HEADERS_USE_EXPECT_CONTINUE_DEFAULT =
-      ClientConfiguration.DEFAULT_USE_EXPECT_CONTINUE;
+      true;
 
   public static final String BEHAVIOR_ON_NULL_VALUES_CONFIG = "behavior.on.null.values";
   public static final String BEHAVIOR_ON_NULL_VALUES_DEFAULT = OutputWriteBehavior.FAIL.toString();
 
+  public static final String REPORT_NULL_RECORDS_TO_DLQ = "report.null.values.to.dlq";
+  public static final boolean REPORT_NULL_RECORDS_TO_DLQ_DEFAULT = true;
+  public static final String REPORT_NULL_RECORDS_TO_DLQ_DOC =
+      "Determine whether to log records with null values to dlq. "
+          + "`errors.tolerance` should be set to 'all' for successfully writing into dlq";
+  public static final String REPORT_NULL_RECORDS_TO_DLQ_DISPLAY = "Report null value to dlq";
+
+  public static final String MAX_WRITE_DURATION = "max.write.duration.ms";
+  public static final long MAX_WRITE_DURATION_DEFAULT = Long.MAX_VALUE;
+  public static final String MAX_WRITE_DURATION_DOC = "The maximum duration that a task will "
+      + "spend in batching and writing to S3. If the write operation takes longer than this "
+      + "the task will voluntarily return from the put method. This prevents the consumer from "
+      + "being revoked from the group. It also mitigates (but does not eliminate) the risk of "
+      + "a zombie task to continue writing to S3 after it has been revoked.";
+
+  public static final String ROTATE_FILE_ON_PARTITION_CHANGE = "rotate.file.on.partition.change";
+  public static final String ROTATE_FILE_ON_PARTITION_CHANGE_DOC
+      = "Flag to determine whether we want to rotate existing files when the record belongs to a "
+      + "new file. This flag will be honored when rotate.interval.ms is set and timestamp.extractor"
+      + " is configured";
+  public static final boolean ROTATE_FILE_ON_PARTITION_CHANGE_DEFAULT = true;
+
   /**
    * Maximum back-off time when retrying failed requests.
    */
-  public static final int S3_RETRY_MAX_BACKOFF_TIME_MS = (int) TimeUnit.HOURS.toMillis(24);
+  public static final Duration S3_RETRY_MAX_BACKOFF_TIME_MS = Duration.ofDays(1);
 
   public static final String S3_RETRY_BACKOFF_CONFIG = "s3.retry.backoff.ms";
   public static final int S3_RETRY_BACKOFF_DEFAULT = 200;
@@ -214,6 +248,9 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   public static final String SCHEMA_PARTITION_AFFIX_TYPE_DOC = "Append the record schema name "
       + "to prefix or suffix in the s3 path after the topic name."
       + " None will not append the schema name in the s3 path.";
+
+  public static final String PARTITIONER_MAX_OPEN_FILES_CONFIG = "partitioner.max.open.files";
+  public static final int PARTITIONER_MAX_OPEN_FILES_DEFAULT = -1;
 
   private static final GenericRecommender SCHEMA_PARTITION_AFFIX_TYPE_RECOMMENDER =
       new GenericRecommender();
@@ -274,6 +311,7 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
         Arrays.stream(AffixType.names()).collect(Collectors.toList()));
   }
 
+  @SuppressWarnings({"checkstyle:JavaNCSS"})
   public static ConfigDef newConfigDef() {
     ConfigDef configDef = StorageSinkConnectorConfig.newConfigDef(
         FORMAT_CLASS_RECOMMENDER,
@@ -380,7 +418,7 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           Importance.LOW,
           "Credentials provider or provider chain to use for authentication to AWS. By default "
               + "the connector uses ``"
-              + DefaultAWSCredentialsProviderChain.class.getSimpleName()
+              + DefaultCredentialsProvider.class.getSimpleName()
               + "``.",
 
           group,
@@ -421,9 +459,9 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           "AWS Secret Access Key"
       );
 
-      List<String> validSsea = new ArrayList<>(SSEAlgorithm.values().length + 1);
+      List<String> validSsea = new ArrayList<>(ServerSideEncryption.values().length + 1);
       validSsea.add("");
-      for (SSEAlgorithm algo : SSEAlgorithm.values()) {
+      for (ServerSideEncryption algo : ServerSideEncryption.knownValues()) {
         validSsea.add(algo.toString());
       }
       configDef.define(
@@ -459,8 +497,8 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           Importance.LOW,
           "The name of the AWS Key Management Service (AWS-KMS) key to be used for server side "
               + "encryption of the S3 objects. No encryption is used when no key is provided, but"
-              + " it is enabled when ``" + SSEAlgorithm.KMS + "`` is specified as encryption "
-              + "algorithm with a valid key name.",
+              + " it is enabled when ``" + ServerSideEncryption.AWS_KMS + "`` is specified as "
+              + "encryption algorithm with a valid key name.",
           group,
           ++orderInGroup,
           Width.LONG,
@@ -685,6 +723,42 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           "Behavior for null-valued records"
       );
 
+      configDef.define(
+          REPORT_NULL_RECORDS_TO_DLQ,
+          Type.BOOLEAN,
+          REPORT_NULL_RECORDS_TO_DLQ_DEFAULT,
+          Importance.LOW,
+          REPORT_NULL_RECORDS_TO_DLQ_DOC,
+          group,
+          ++orderInGroup,
+          Width.SHORT,
+          REPORT_NULL_RECORDS_TO_DLQ_DISPLAY
+      );
+
+      configDef.define(
+          MAX_WRITE_DURATION,
+          Type.LONG,
+          MAX_WRITE_DURATION_DEFAULT,
+          Importance.LOW,
+          MAX_WRITE_DURATION_DOC,
+          group,
+          ++orderInGroup,
+          Width.SHORT,
+          "Maximum write duration"
+      );
+
+      configDef.define(
+          ROTATE_FILE_ON_PARTITION_CHANGE,
+          Type.BOOLEAN,
+          ROTATE_FILE_ON_PARTITION_CHANGE_DEFAULT,
+          Importance.LOW,
+          ROTATE_FILE_ON_PARTITION_CHANGE_DOC,
+          group,
+          ++orderInGroup,
+          Width.SHORT,
+          "Rotate files on partition change"
+      );
+
       // This is done to avoid aggressive schema based rotations resulting out of interleaving
       // of tombstones with regular records.
       configDef.define(
@@ -700,7 +774,6 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           "Tombstone Encoded Partition"
       );
 
-
       configDef.define(
           SCHEMA_PARTITION_AFFIX_TYPE_CONFIG,
           Type.STRING,
@@ -713,6 +786,37 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           Width.LONG,
           "Schema Partition Affix Type",
           SCHEMA_PARTITION_AFFIX_TYPE_RECOMMENDER
+      );
+
+      configDef.define(
+          SEND_DIGEST_CONFIG,
+          Type.BOOLEAN,
+          SEND_DIGEST_DEFAULT,
+          Importance.LOW,
+          "Enable or disable sending MD5 digest with S3 multipart upload request.",
+          group,
+          ++orderInGroup,
+          Width.SHORT,
+          "S3 Send Upload Message Digest"
+      );
+
+      configDef.define(
+          ENABLE_CONDITIONAL_WRITES_CONFIG,
+          Type.BOOLEAN,
+          ENABLE_CONDITIONAL_WRITES_DEFAULT,
+          Importance.LOW,
+          ENABLE_CONDITIONAL_WRITES_DOC,
+          group,
+          ++orderInGroup,
+          Width.SHORT,
+          "Enable conditional writes during multipart upload"
+      );
+
+      configDef.defineInternal(
+          MAX_FILE_SCAN_LIMIT_CONFIG,
+          Type.INT,
+          MAX_FILE_SCAN_LIMIT_DEFAULT,
+          Importance.LOW
       );
     }
 
@@ -811,6 +915,12 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           "Elastic buffer initial capacity"
       );
 
+      configDef.defineInternal(
+          PARTITIONER_MAX_OPEN_FILES_CONFIG,
+          Type.INT,
+          PARTITIONER_MAX_OPEN_FILES_DEFAULT,
+          Importance.LOW
+      );
     }
     return configDef;
   }
@@ -880,8 +990,8 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
     return getBoolean(HEADERS_USE_EXPECT_CONTINUE_CONFIG);
   }
 
-  public CannedAccessControlList getCannedAcl() {
-    return CannedAclValidator.ACLS_BY_HEADER_VALUE.get(getString(ACL_CANNED_CONFIG));
+  public ObjectCannedACL getCannedAcl() {
+    return ObjectCannedACL.fromValue(getString(ACL_CANNED_CONFIG));
   }
 
   public String awsAccessKeyId() {
@@ -897,10 +1007,14 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   }
 
   @SuppressWarnings("unchecked")
-  public AWSCredentialsProvider getCredentialsProvider() {
+  public AwsCredentialsProvider getCredentialsProvider() {
     try {
-      AWSCredentialsProvider provider = ((Class<? extends AWSCredentialsProvider>)
-          getClass(S3SinkConnectorConfig.CREDENTIALS_PROVIDER_CLASS_CONFIG)).newInstance();
+      Class<AwsCredentialsProvider> providerClass =
+          (Class<AwsCredentialsProvider>) getClass(
+              S3SinkConnectorConfig.CREDENTIALS_PROVIDER_CLASS_CONFIG);
+      Method method = providerClass.getMethod("create");
+
+      AwsCredentialsProvider provider = (AwsCredentialsProvider) method.invoke(null);
 
       if (provider instanceof Configurable) {
         Map<String, Object> configs = originalsWithPrefix(CREDENTIALS_PROVIDER_CONFIG_PREFIX);
@@ -916,13 +1030,13 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
         final String accessKeyId = awsAccessKeyId();
         final String secretKey = awsSecretKeyId().value();
         if (StringUtils.isNotBlank(accessKeyId) && StringUtils.isNotBlank(secretKey)) {
-          BasicAWSCredentials basicCredentials = new BasicAWSCredentials(accessKeyId, secretKey);
-          provider = new AWSStaticCredentialsProvider(basicCredentials);
+          AwsBasicCredentials basicCredentials = AwsBasicCredentials.create(accessKeyId, secretKey);
+          provider = StaticCredentialsProvider.create(basicCredentials);
         }
       }
 
       return provider;
-    } catch (IllegalAccessException | InstantiationException e) {
+    } catch (IllegalAccessException | NoSuchMethodException | InvocationTargetException e) {
       throw new ConnectException(
           "Invalid class for: " + S3SinkConnectorConfig.CREDENTIALS_PROVIDER_CLASS_CONFIG,
           e
@@ -936,6 +1050,10 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
 
   public int getCompressionLevel() {
     return getInt(COMPRESSION_LEVEL_CONFIG);
+  }
+
+  public boolean isSendDigestEnabled() {
+    return getBoolean(SEND_DIGEST_CONFIG);
   }
 
   public String getJsonDecimalFormat() {
@@ -993,6 +1111,13 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
     return getInt(ELASTIC_BUFFER_INIT_CAPACITY);
   }
 
+  public boolean shouldEnableConditionalWrites() {
+    return getBoolean(ENABLE_CONDITIONAL_WRITES_CONFIG)
+        && getLong(ROTATE_SCHEDULE_INTERVAL_MS_CONFIG) != -1
+        && !getBoolean(STORE_KAFKA_HEADERS_CONFIG)
+        && !getBoolean(STORE_KAFKA_KEYS_CONFIG);
+  }
+
   public boolean isTombstoneWriteEnabled() {
     return OutputWriteBehavior.WRITE.toString().equalsIgnoreCase(nullValueBehavior());
   }
@@ -1008,6 +1133,10 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
 
   public String getName() {
     return name;
+  }
+
+  private static String oneOfValuesErrorMessage(Collection values) {
+    return "Value must be one of: " + values;
   }
 
   @Override
@@ -1067,7 +1196,7 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   private static class RegionRecommender implements ConfigDef.Recommender {
     @Override
     public List<Object> validValues(String name, Map<String, Object> connectorConfigs) {
-      return new ArrayList<>(RegionUtils.getRegions());
+      return new ArrayList<>(Region.regions());
     }
 
     @Override
@@ -1080,39 +1209,41 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
     @Override
     public void ensureValid(String name, Object region) {
       String regionStr = ((String) region).toLowerCase().trim();
-      if (RegionUtils.getRegion(regionStr) == null) {
+      if (Region.of(regionStr) == null) {
         throw new ConfigException(
             name,
             region,
-            "Value must be one of: " + Utils.join(RegionUtils.getRegions(), ", ")
+            oneOfValuesErrorMessage(Region.regions().stream()
+                .map((Region::toString))
+                .collect(Collectors.toList()))
         );
       }
     }
 
     @Override
     public String toString() {
-      return "[" + Utils.join(RegionUtils.getRegions(), ", ") + "]";
+      return "[" + Region.regions().stream()
+          .map((Region::toString))
+          .collect(Collectors.joining(", ")) + "]";
     }
   }
 
   private static class CompressionTypeValidator implements ConfigDef.Validator {
     public static final Map<String, CompressionType> TYPES_BY_NAME = new HashMap<>();
-    public static final String ALLOWED_VALUES;
+    public static final List<String> ALLOWED_VALUES = new ArrayList<>();
 
     static {
-      List<String> names = new ArrayList<>();
       for (CompressionType compressionType : CompressionType.values()) {
         TYPES_BY_NAME.put(compressionType.name, compressionType);
-        names.add(compressionType.name);
+        ALLOWED_VALUES.add(compressionType.name);
       }
-      ALLOWED_VALUES = Utils.join(names, ", ");
     }
 
     @Override
     public void ensureValid(String name, Object compressionType) {
       String compressionTypeString = ((String) compressionType).trim();
       if (!TYPES_BY_NAME.containsKey(compressionTypeString)) {
-        throw new ConfigException(name, compressionType, "Value must be one of: " + ALLOWED_VALUES);
+        throw new ConfigException(name, compressionType, oneOfValuesErrorMessage(ALLOWED_VALUES));
       }
     }
 
@@ -1175,28 +1306,17 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
       String compressionCodecNameString = ((String) compressionCodecName).trim();
       if (!TYPES_BY_NAME.containsKey(compressionCodecNameString)) {
         throw new ConfigException(name, compressionCodecName,
-            "Value must be one of: " + ALLOWED_VALUES);
+            oneOfValuesErrorMessage(ALLOWED_VALUES));
       }
     }
 
     @Override
     public String toString() {
-      return "[" + Utils.join(ALLOWED_VALUES, ", ") + "]";
+      return "[" + String.join(", ", ALLOWED_VALUES) + "]";
     }
   }
 
   private static class CannedAclValidator implements ConfigDef.Validator {
-    public static final Map<String, CannedAccessControlList> ACLS_BY_HEADER_VALUE = new HashMap<>();
-    public static final String ALLOWED_VALUES;
-
-    static {
-      List<String> aclHeaderValues = new ArrayList<>();
-      for (CannedAccessControlList acl : CannedAccessControlList.values()) {
-        ACLS_BY_HEADER_VALUE.put(acl.toString(), acl);
-        aclHeaderValues.add(acl.toString());
-      }
-      ALLOWED_VALUES = Utils.join(aclHeaderValues, ", ");
-    }
 
     @Override
     public void ensureValid(String name, Object cannedAcl) {
@@ -1204,42 +1324,42 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
         return;
       }
       String aclStr = ((String) cannedAcl).trim();
-      if (!ACLS_BY_HEADER_VALUE.containsKey(aclStr)) {
-        throw new ConfigException(name, cannedAcl, "Value must be one of: " + ALLOWED_VALUES);
+      if (ObjectCannedACL.UNKNOWN_TO_SDK_VERSION.equals(ObjectCannedACL.fromValue(aclStr))) {
+        throw new ConfigException(name, cannedAcl,
+            oneOfValuesErrorMessage(ObjectCannedACL.knownValues()));
       }
     }
 
     @Override
     public String toString() {
-      return "[" + ALLOWED_VALUES + "]";
+      return "[" + ObjectCannedACL.knownValues() + "]";
     }
   }
 
   private static class CredentialsProviderValidator implements ConfigDef.Validator {
     @Override
     public void ensureValid(String name, Object provider) {
-      if (provider != null && provider instanceof Class
-              && AWSCredentialsProvider.class.isAssignableFrom((Class<?>) provider)) {
+      if (provider instanceof Class
+          && AwsCredentialsProvider.class.isAssignableFrom((Class<?>) provider)) {
         return;
       }
       throw new ConfigException(
           name,
           provider,
-          "Class must extend: " + AWSCredentialsProvider.class
+          "Class must extend: " + AwsCredentialsProvider.class
       );
     }
 
     @Override
     public String toString() {
-      return "Any class implementing: " + AWSCredentialsProvider.class;
+      return "Any class implementing: " + AwsCredentialsProvider.class;
     }
   }
 
   private static class SseAlgorithmRecommender implements ConfigDef.Recommender {
     @Override
     public List<Object> validValues(String name, Map<String, Object> connectorConfigs) {
-      List<SSEAlgorithm> list = Arrays.asList(SSEAlgorithm.values());
-      return new ArrayList<Object>(list);
+      return new ArrayList<Object>(ServerSideEncryption.knownValues());
     }
 
     @Override
@@ -1259,7 +1379,7 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
 
     @Override
     public boolean visible(String name, Map<String, Object> connectorConfigs) {
-      return SSEAlgorithm.KMS.toString()
+      return ServerSideEncryption.AWS_KMS.toString()
           .equalsIgnoreCase((String) connectorConfigs.get(SSEA_CONFIG));
     }
   }
@@ -1288,6 +1408,14 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
 
   public String nullValueBehavior() {
     return getString(BEHAVIOR_ON_NULL_VALUES_CONFIG);
+  }
+
+  public boolean reportNullRecordsToDlq() {
+    return getBoolean(REPORT_NULL_RECORDS_TO_DLQ);
+  }
+
+  public boolean shouldRotateOnPartitionChange() {
+    return getBoolean(ROTATE_FILE_ON_PARTITION_CHANGE);
   }
 
   public enum IgnoreOrFailBehavior {

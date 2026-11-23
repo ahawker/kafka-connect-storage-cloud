@@ -19,40 +19,75 @@ import static io.confluent.connect.s3.S3SinkConnectorConfig.AWS_ACCESS_KEY_ID_CO
 import static io.confluent.connect.s3.S3SinkConnectorConfig.AWS_SECRET_ACCESS_KEY_CONFIG;
 import static io.confluent.kafka.schemaregistry.ClusterTestHarness.KAFKASTORE_TOPIC;
 
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.AmazonS3ClientBuilder;
-import com.amazonaws.services.s3.model.GetObjectRequest;
-import com.amazonaws.services.s3.model.ListObjectsV2Request;
-import com.amazonaws.services.s3.model.ListObjectsV2Result;
-import com.amazonaws.services.s3.model.S3ObjectSummary;
+import io.confluent.connect.s3.util.S3FileUtils;
+import io.confluent.connect.s3.util.EmbeddedConnectUtils;
+import org.apache.avro.generic.GenericData;
+import org.apache.commons.io.FileUtils;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.core.sync.ResponseTransformer;
+import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
+import software.amazon.awssdk.services.s3.model.DeleteBucketRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.HeadBucketResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.Tag;
+import software.amazon.awssdk.services.s3.model.Tagging;
+import software.amazon.awssdk.services.s3.model.GetObjectTaggingRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectTaggingResponse;
+
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
 import io.confluent.common.utils.IntegrationTest;
 import io.confluent.kafka.schemaregistry.CompatibilityLevel;
 import io.confluent.kafka.schemaregistry.RestApp;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.connect.json.JsonConverter;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.io.InputFile;
+import java.nio.file.Paths;
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import io.confluent.connect.s3.util.S3Utils;
+
 import java.util.function.Function;
 import java.util.stream.Collectors;
+
 import org.apache.avro.file.DataFileReader;
 import org.apache.avro.generic.GenericDatumReader;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.parquet.avro.AvroParquetReader;
+
 import org.apache.avro.io.DatumReader;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -68,9 +103,7 @@ import org.apache.kafka.test.TestUtils;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
-import org.apache.parquet.tools.json.JsonRecordFormatter;
-import org.apache.parquet.tools.read.SimpleReadSupport;
-import org.apache.parquet.tools.read.SimpleRecord;
+
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -78,8 +111,11 @@ import org.junit.BeforeClass;
 import org.junit.experimental.categories.Category;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 @Category(IntegrationTest.class)
 public abstract class BaseConnectorIT {
@@ -87,7 +123,7 @@ public abstract class BaseConnectorIT {
   private static final Logger log = LoggerFactory.getLogger(BaseConnectorIT.class);
 
   protected static final int MAX_TASKS = 3;
-  private static final long S3_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(60);
+  private static final long S3_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(120);
 
   protected static final long CONNECTOR_STARTUP_DURATION_MS = TimeUnit.MINUTES.toMillis(60);
 
@@ -101,7 +137,7 @@ public abstract class BaseConnectorIT {
 
   protected static final int FLUSH_SIZE_STANDARD = 3;
 
-  protected static AmazonS3 S3Client;
+  protected static S3Client s3Client;
 
   protected static final String AVRO_EXTENSION = "avro";
   protected static final String PARQUET_EXTENSION = "snappy.parquet";
@@ -132,17 +168,20 @@ public abstract class BaseConnectorIT {
   @BeforeClass
   public static void setupClient() {
     log.info("Starting ITs...");
-    S3Client = getS3Client();
-    if (S3Client.doesBucketExistV2(TEST_BUCKET_NAME)) {
+    s3Client = getS3Client();
+    S3FileUtils fileUtils = new S3FileUtils(s3Client);
+    if (fileUtils.bucketExists(TEST_BUCKET_NAME)) {
       clearBucket(TEST_BUCKET_NAME);
     } else {
-      S3Client.createBucket(TEST_BUCKET_NAME);
+      s3Client.createBucket(CreateBucketRequest.builder().bucket(TEST_BUCKET_NAME)
+          .build());
     }
   }
 
   @AfterClass
   public static void deleteBucket() {
-    S3Client.deleteBucket(TEST_BUCKET_NAME);
+    s3Client.deleteBucket(DeleteBucketRequest.builder().bucket(TEST_BUCKET_NAME)
+        .build());
     log.info("Finished ITs, removed S3 bucket");
   }
 
@@ -161,7 +200,7 @@ public abstract class BaseConnectorIT {
 
   protected void startConnect() {
     Map<String, String> workerProps = new HashMap<>();
-    workerProps.put("plugin.discovery","hybrid_warn");
+    workerProps.put("plugin.discovery", "hybrid_warn");
     connect = new EmbeddedConnectCluster.Builder()
         .name("s3-connect-cluster").workerProps(workerProps)
         .build();
@@ -181,7 +220,7 @@ public abstract class BaseConnectorIT {
    * @throws InterruptedException if this was interrupted
    */
   protected long waitForFilesInBucket(String bucketName, int numFiles) throws InterruptedException {
-    return S3Utils.waitForFilesInBucket(S3Client, bucketName, numFiles, S3_TIMEOUT_MS);
+    return S3Utils.waitForFilesInBucket(s3Client, bucketName, numFiles, S3_TIMEOUT_MS);
   }
 
   /**
@@ -200,24 +239,63 @@ public abstract class BaseConnectorIT {
       String topic,
       int partition,
       int flushSize,
+      int startOffset,
       long numRecords,
       String extension
   ) {
     int expectedFileCount = (int) numRecords / flushSize;
     List<String> expectedFiles = new ArrayList<>();
-    for (int offset = 0; offset < expectedFileCount * flushSize; offset += flushSize) {
-      String filepath = String.format(
-          "topics/%s/partition=%d/%s+%d+%010d.%s",
-          topic,
-          partition,
-          topic,
-          partition,
-          offset,
-          extension
-      );
+    for (int offset = startOffset; offset < expectedFileCount * flushSize; offset += flushSize) {
+      String filepath = getFilePath(topic, partition, offset, extension);
       expectedFiles.add(filepath);
     }
     return expectedFiles;
+  }
+
+  private String getFilePath(String topic,
+                             int partition,
+                             int offset,
+                             String extension) {
+    return String.format(
+        "topics/%s/partition=%d/%s+%d+%010d.%s",
+        topic,
+        partition,
+        topic,
+        partition,
+        offset,
+        extension
+    );
+  }
+  protected Map<String, Tagging> getExpectedTags(
+      String topic,
+                                    int partition,
+                                    int flushSize,
+                                    int startOffset,
+                                    long numRecords,
+      String extension) {
+    int expectedFileCount = (int) numRecords / flushSize;
+    Map<String, Tagging> tags = new HashMap<>();
+    for (int offset = startOffset; offset < expectedFileCount * flushSize; offset += flushSize) {
+      String filepath = getFilePath(topic, partition, offset, extension);
+      Tag startOffsetTag = Tag.builder()
+          .key("startOffset")
+          .value(String.valueOf(offset))
+          .build();
+
+      Tag endOffset = Tag.builder()
+          .key("endOffset")
+          .value(String.valueOf(offset + flushSize - 1))
+          .build();
+
+      Tag recordCount = Tag.builder()
+          .key("recordCount")
+          .value(String.valueOf(flushSize))
+          .build();
+      tags.put(filepath, Tagging.builder()
+          .tagSet(Arrays.asList(startOffsetTag, endOffset, recordCount))
+          .build());
+    }
+    return tags;
   }
 
   /**
@@ -225,12 +303,12 @@ public abstract class BaseConnectorIT {
    * <p>
    * Format: topics/s3_topic/tombstone/s3_topic+97+0000000001.keys.avro
    *
-   * @param topic      the test kafka topic
-   * @param partition  the expected partition for the tests
-   * @param flushSize  the flush size connector config
-   * @param numRecords the number of records produced in the test
-   * @param extension  the expected extensions of the files including compression (snappy.parquet)
-   * @param tombstonePartition  the expected directory for tombstone records
+   * @param topic              the test kafka topic
+   * @param partition          the expected partition for the tests
+   * @param flushSize          the flush size connector config
+   * @param numRecords         the number of records produced in the test
+   * @param extension          the expected extensions of the files including compression (snappy.parquet)
+   * @param tombstonePartition the expected directory for tombstone records
    * @return the list of expected filenames
    */
   protected List<String> getExpectedTombstoneFilenames(
@@ -278,20 +356,21 @@ public abstract class BaseConnectorIT {
    */
   private List<String> getBucketFileNames(String bucketName) {
     List<String> actualFiles = new ArrayList<>();
-    ListObjectsV2Request request = new ListObjectsV2Request().withBucketName(bucketName);
-    ListObjectsV2Result result;
+    ListObjectsV2Request.Builder request = ListObjectsV2Request.builder().bucket(bucketName);
+
+    ListObjectsV2Response result;
     do {
       /*
        Need the result object to extract the continuation token from the request as each request
        to listObjectsV2() returns a maximum of 1000 files.
        */
-      result = S3Client.listObjectsV2(request);
-      for (S3ObjectSummary file : result.getObjectSummaries()) {
-        actualFiles.add(file.getKey());
+      result = s3Client.listObjectsV2(request.build());
+      for (S3Object file : result.contents()) {
+        actualFiles.add(file.key());
       }
-      String token = result.getNextContinuationToken();
+      String token = result.nextContinuationToken();
       // To get the next batch of files.
-      request.setContinuationToken(token);
+      request.continuationToken(token);
     } while(result.isTruncated());
     return actualFiles;
   }
@@ -348,7 +427,7 @@ public abstract class BaseConnectorIT {
   }
 
   protected SinkRecord getSampleTopicRecord(String topicName, Schema recordValueSchema,
-      Struct recordValueStruct) {
+                                            Struct recordValueStruct) {
     return new SinkRecord(
         topicName,
         TOPIC_PARTITION,
@@ -364,7 +443,7 @@ public abstract class BaseConnectorIT {
     return getSampleTopicRecord(topic, recordValueSchema, recordValueStruct);
   }
 
-  protected Iterable<Header> sampleHeaders() {
+  protected static Iterable<Header> sampleHeaders() {
     return Arrays.asList(
         new RecordHeader("first-header-key", "first-header-value".getBytes()),
         new RecordHeader("second-header-key", "second-header-value".getBytes())
@@ -376,20 +455,19 @@ public abstract class BaseConnectorIT {
    *
    * @return an authenticated S3 client
    */
-  protected static AmazonS3 getS3Client() {
+  protected static S3Client getS3Client() {
     Map<String, String> creds = getAWSCredentialFromPath();
     // If AWS credentials found on AWS_CREDENTIALS_PATH, use them (Jenkins)
     if (creds.size() == 2) {
-      BasicAWSCredentials awsCreds = new BasicAWSCredentials(
-          creds.get(AWS_ACCESS_KEY_ID_CONFIG),
-          creds.get(AWS_SECRET_ACCESS_KEY_CONFIG));
-      return AmazonS3ClientBuilder.standard()
-          .withCredentials(new AWSStaticCredentialsProvider(awsCreds))
+      AwsBasicCredentials awsCreds = AwsBasicCredentials.create(creds.get(AWS_ACCESS_KEY_ID_CONFIG), creds.get(AWS_SECRET_ACCESS_KEY_CONFIG));
+      return S3Client.builder()
+          .credentialsProvider(StaticCredentialsProvider.create(awsCreds))
+          .region(Region.of(AWS_REGION))
           .build();
     }
     // DefaultAWSCredentialsProviderChain,
     // For local testing,  ~/.aws/credentials needs to be defined or other environment variables
-    return AmazonS3ClientBuilder.standard().withRegion(AWS_REGION).build();
+    return S3Client.builder().region(Region.of(AWS_REGION)).build();
   }
 
   /**
@@ -398,9 +476,33 @@ public abstract class BaseConnectorIT {
    * @param bucketName the name of the bucket to clear.
    */
   protected static void clearBucket(String bucketName) {
-    for (S3ObjectSummary file : S3Client.listObjectsV2(bucketName).getObjectSummaries()) {
-      S3Client.deleteObject(bucketName, file.getKey());
+    for (S3Object file : s3Client.listObjectsV2(ListObjectsV2Request.builder().bucket(bucketName).build()).contents()) {
+      s3Client.deleteObject(DeleteObjectRequest.builder().bucket(bucketName).key(file.key()).build());
     }
+  }
+
+  /**
+   * Count total number of records stored in S3
+   *
+   * @param bucketName the name of the s3 test bucket
+   * @return number of records in S3
+   */
+  protected int countNumberOfRecords(
+      String bucketName
+  ) throws IOException {
+    int rowCount = 0;
+    for (String fileName :
+        getS3FileListValues(s3Client.listObjectsV2(ListObjectsV2Request.builder().bucket(bucketName).build()))) {
+      String destinationPath = TEST_DOWNLOAD_PATH + fileName;
+      File downloadedFile = downloadFile(bucketName, fileName, destinationPath);
+
+      String fileExtension = getExtensionFromKey(fileName);
+      List<JsonNode> downloadedFileContents = contentGetters.get(fileExtension)
+          .apply(destinationPath);
+      rowCount += downloadedFileContents.size();
+      downloadedFile.delete();
+    }
+    return rowCount;
   }
 
   /**
@@ -415,14 +517,19 @@ public abstract class BaseConnectorIT {
       String bucketName,
       int expectedRowsPerFile,
       Struct expectedRow
-  ) {
+  ) throws IOException {
     log.info("expectedRow: {}", expectedRow);
     for (String fileName :
-        getS3FileListValues(S3Client.listObjectsV2(bucketName).getObjectSummaries())) {
+        getS3FileListValues(s3Client.listObjectsV2(ListObjectsV2Request.builder().bucket(bucketName).build()))) {
       String destinationPath = TEST_DOWNLOAD_PATH + fileName;
       File downloadedFile = new File(destinationPath);
       log.info("Saving file to : {}", destinationPath);
-      S3Client.getObject(new GetObjectRequest(bucketName, fileName), downloadedFile);
+      ResponseInputStream<GetObjectResponse> is = s3Client.getObject(
+          GetObjectRequest.builder()
+              .bucket(bucketName).key(fileName)
+              .build());
+
+      FileUtils.copyInputStreamToFile(is, downloadedFile);
 
       String fileExtension = getExtensionFromKey(fileName);
       List<JsonNode> downloadedFileContents = contentGetters.get(fileExtension)
@@ -435,21 +542,47 @@ public abstract class BaseConnectorIT {
     return true;
   }
 
+  private File downloadFile(String bucketName, String s3Filename, String destinationPath) throws IOException {
+
+    log.info("Saving file to : {}", destinationPath);
+
+    ResponseInputStream<GetObjectResponse> is = s3Client.getObject(
+        GetObjectRequest.builder()
+            .bucket(bucketName).key(s3Filename)
+            .build());
+    File downloadedFile = new File(destinationPath);
+    FileUtils.copyInputStreamToFile(is, downloadedFile);
+    return downloadedFile;
+  }
+
   protected boolean keyfileContentsAsExpected(
       String bucketName,
       int expectedRowsPerFile,
       String expectedKey
-  ) {
+  ) throws IOException {
     log.info("expectedKey: {}", expectedKey);
+
+    ListObjectsV2Request listObjectsV2Request = ListObjectsV2Request.builder()
+        .bucket(bucketName)
+        .build();
+
     for (String fileName :
-        getS3KeyFileList(S3Client.listObjectsV2(bucketName).getObjectSummaries())) {
+        getS3KeyFileList(s3Client.listObjectsV2Paginator(listObjectsV2Request))) {
       String destinationPath = TEST_DOWNLOAD_PATH + fileName;
       File downloadedFile = new File(destinationPath);
       log.info("Saving file to : {}", destinationPath);
-      S3Client.getObject(new GetObjectRequest(bucketName, fileName), downloadedFile);
+
+      ResponseInputStream<GetObjectResponse> is = s3Client.getObject(
+          GetObjectRequest.builder()
+              .bucket(bucketName
+              ).key(fileName)
+              .build());
+
+      FileUtils.copyInputStreamToFile(is, downloadedFile);
+
       List<String> keyContent = new ArrayList<>();
       try (FileReader fileReader = new FileReader(destinationPath);
-          BufferedReader bufferedReader = new BufferedReader(fileReader)) {
+           BufferedReader bufferedReader = new BufferedReader(fileReader)) {
         String line;
         while ((line = bufferedReader.readLine()) != null) {
           keyContent.add(line);
@@ -462,7 +595,7 @@ public abstract class BaseConnectorIT {
             keyContent.size(), expectedRowsPerFile);
         return false;
       }
-      for (String actualKey: keyContent) {
+      for (String actualKey : keyContent) {
         if (!expectedKey.equals(actualKey)) {
           log.error("Key {} did not match the contents in the key file {}", expectedKey, actualKey);
           return false;
@@ -501,11 +634,11 @@ public abstract class BaseConnectorIT {
     return true;
   }
 
-  private List<String> getS3KeyFileList(List<S3ObjectSummary> summaries) {
+  private List<String> getS3KeyFileList(ListObjectsV2Iterable response) {
     final String includeExtensions = ".keys.";
-    return summaries.stream()
-        .filter(summary -> summary.getKey().contains(includeExtensions))
-        .map(S3ObjectSummary::getKey)
+    return response.contents().stream()
+        .filter(summary -> summary.key().contains(includeExtensions))
+        .map(S3Object::key)
         .collect(Collectors.toList());
   }
 
@@ -532,7 +665,7 @@ public abstract class BaseConnectorIT {
 
   // whether a filename contains any of the extensions
   private boolean filenameContainsExtensions(String filename, List<String> extensions) {
-    for (String extension : extensions){
+    for (String extension : extensions) {
       if (filename.endsWith(extension)) {
         return true;
       }
@@ -541,11 +674,11 @@ public abstract class BaseConnectorIT {
   }
 
   // filter for values only.
-  private List<String> getS3FileListValues(List<S3ObjectSummary> summaries) {
+  private List<String> getS3FileListValues(ListObjectsV2Response summaries) {
     List<String> excludeExtensions = Arrays.asList(".headers.avro", ".keys.avro");
-    return summaries.stream()
-        .filter(summary -> !filenameContainsExtensions(summary.getKey(), excludeExtensions))
-        .map(S3ObjectSummary::getKey)
+    return summaries.contents().stream()
+        .filter(summary -> !filenameContainsExtensions(summary.key(), excludeExtensions))
+        .map(S3Object::key)
         .collect(Collectors.toList());
   }
 
@@ -579,18 +712,20 @@ public abstract class BaseConnectorIT {
    * @return the rows of the file as JsonNodes
    */
   private static List<JsonNode> getContentsFromParquet(String filePath) {
-    try (ParquetReader<SimpleRecord> reader = ParquetReader
-        .builder(new SimpleReadSupport(), new Path(filePath)).build()){
-      ParquetMetadata metadata = ParquetFileReader
-          .readFooter(new Configuration(), new Path(filePath));
-      JsonRecordFormatter.JsonGroupFormatter formatter = JsonRecordFormatter
-          .fromSchema(metadata.getFileMetaData().getSchema());
-      List<JsonNode> fileRows = new ArrayList<>();
-      for (SimpleRecord value = reader.read(); value != null; value = reader.read()) {
-        JsonNode jsonNode = jsonMapper.readTree(formatter.formatRecord(value));
-        fileRows.add(jsonNode);
+    List<JsonNode> fileRows = new ArrayList<JsonNode>();
+    try {
+      InputFile inputFile = HadoopInputFile.fromPath(new org.apache.hadoop.fs.Path(filePath), new Configuration());
+      try (ParquetReader<GenericData.Record> recordAvroParquetReader =
+               AvroParquetReader.<GenericData.Record>builder(inputFile)
+                   .build()) {
+        GenericData.Record record;
+        while ((record = recordAvroParquetReader.read()) != null) {
+          fileRows.add(jsonMapper.readTree(record.toString()));
+        }
+        return fileRows;
+      } catch (IOException e) {
+        throw new RuntimeException(e);
       }
-      return fileRows;
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
@@ -647,7 +782,7 @@ public abstract class BaseConnectorIT {
 
   protected static Map<String, String> getAWSCredentialFromPath() {
     Map<String, String> map = new HashMap<>();
-    if  (!System.getenv().containsKey(AWS_CREDENTIALS_PATH)) {
+    if (!System.getenv().containsKey(AWS_CREDENTIALS_PATH)) {
       return map;
     }
     String path = System.getenv().get(AWS_CREDENTIALS_PATH);
@@ -660,7 +795,7 @@ public abstract class BaseConnectorIT {
       }
       value = creds.get("aws_secret_access_key");
       if (value != null && !value.isEmpty()) {
-        map.put(AWS_SECRET_ACCESS_KEY_CONFIG,value);
+        map.put(AWS_SECRET_ACCESS_KEY_CONFIG, value);
       }
     } catch (Exception e) {
       e.printStackTrace();
@@ -669,5 +804,123 @@ public abstract class BaseConnectorIT {
       );
     }
     return map;
+  }
+
+  protected void testBasicRecordsWrittenToSink(String expectedFileExtension,
+                                               boolean addExtensionInTopic,
+                                               List<String> kafkaTopics,
+                                               String connectorName,
+                                               JsonConverter jsonConverter,
+                                               Producer<byte[], byte[]> producer,
+                                               String bucketName,
+                                               boolean validateTagging) throws Throwable {
+    final String topicNameWithExt =
+        "other." + expectedFileExtension + ".topic." + expectedFileExtension;
+
+    // Add an extra topic with this extension inside of the name
+    // Use a TreeSet for test determinism
+    Set<String> topicNames = new TreeSet<>(kafkaTopics);
+
+    if (addExtensionInTopic) {
+      topicNames.add(topicNameWithExt);
+      connect.kafka().createTopic(topicNameWithExt, 1);
+      props.replace(
+          "topics",
+          props.get("topics") + "," + topicNameWithExt
+      );
+    }
+
+    // start sink connector
+    connect.configureConnector(connectorName, props);
+    // wait for tasks to spin up
+    EmbeddedConnectUtils.waitForConnectorToStart(connect, connectorName,
+        Math.min(topicNames.size(), MAX_TASKS));
+
+    Schema recordValueSchema = getSampleStructSchema();
+    Struct recordValueStruct = getSampleStructVal(recordValueSchema);
+
+    for (String thisTopicName : topicNames) {
+      // Create and send records to Kafka using the topic name in the current 'thisTopicName'
+      SinkRecord sampleRecord = getSampleTopicRecord(thisTopicName, recordValueSchema, recordValueStruct);
+      produceRecords(sampleRecord.topic(), NUM_RECORDS_INSERT, sampleRecord,
+          true, true, false, jsonConverter, producer);
+    }
+
+    log.info("Waiting for files in S3...");
+    int countPerTopic = NUM_RECORDS_INSERT / FLUSH_SIZE_STANDARD;
+    int expectedTotalFileCount = countPerTopic * topicNames.size();
+    waitForFilesInBucket(bucketName, expectedTotalFileCount);
+
+    Set<String> expectedTopicFilenames = new TreeSet<>();
+    Map<String, Tagging> tags = new HashMap<>();
+    for (String thisTopicName : topicNames) {
+      tags.putAll(getExpectedTags(thisTopicName, TOPIC_PARTITION, FLUSH_SIZE_STANDARD, 0, NUM_RECORDS_INSERT, expectedFileExtension));
+      List<String> theseFiles = getExpectedFilenames(
+          thisTopicName,
+          TOPIC_PARTITION,
+          FLUSH_SIZE_STANDARD,
+          0,
+          NUM_RECORDS_INSERT,
+          expectedFileExtension
+      );
+      assertEquals(theseFiles.size(), countPerTopic);
+      expectedTopicFilenames.addAll(theseFiles);
+    }
+    // This check will catch any duplications
+    assertEquals(expectedTopicFilenames.size(), expectedTotalFileCount);
+    // The total number of files allowed in the bucket is number of topics * # produced for each
+    // All topics should have produced the same number of files, so this check should hold.
+    assertFileNamesValid(bucketName, new ArrayList<>(expectedTopicFilenames));
+    // Now check that all files created by the sink have the contents that were sent
+    // to the producer (they're all the same content)
+    assertTrue(fileContentsAsExpected(bucketName, FLUSH_SIZE_STANDARD, recordValueStruct));
+    
+    // Validate tags if requested
+    if (validateTagging) {
+      validateTags(tags);
+    }
+  }
+
+  private void validateTags(Map<String, Tagging> tags) {
+    for (Map.Entry<String, Tagging> entry : tags.entrySet()) {
+      GetObjectTaggingRequest getObjectTaggingRequest = GetObjectTaggingRequest.builder()
+          .bucket(TEST_BUCKET_NAME)
+          .key(entry.getKey())
+          .build();
+
+      GetObjectTaggingResponse getObjectTaggingResponse = s3Client.getObjectTagging(getObjectTaggingRequest);
+      List<Tag> actualTags = getObjectTaggingResponse.tagSet();
+      assertEquals(actualTags.size(), entry.getValue().tagSet().size());
+      assertTrue(actualTags.containsAll(entry.getValue().tagSet()));
+    }
+  }
+
+  protected void produceRecords(
+      String topic,
+      int recordCount,
+      SinkRecord record,
+      boolean withKey,
+      boolean withValue,
+      boolean withHeaders,
+      JsonConverter jsonConverter,
+      Producer<byte[], byte[]> producer
+  ) throws ExecutionException, InterruptedException {
+    byte[] kafkaKey = null;
+    byte[] kafkaValue = null;
+    Iterable<Header> headers = Collections.emptyList();
+    if (withKey) {
+      kafkaKey = jsonConverter.fromConnectData(topic, Schema.STRING_SCHEMA, record.key());
+    }
+    if (withValue) {
+      kafkaValue = jsonConverter.fromConnectData(record.topic(), record.valueSchema(), record.value());
+    }
+    if (withHeaders) {
+      headers = sampleHeaders();
+    }
+    ProducerRecord<byte[], byte[]> producerRecord =
+        new ProducerRecord<>(topic, TOPIC_PARTITION, kafkaKey, kafkaValue, headers);
+    for (long i = 0; i < recordCount; i++) {
+      producer.send(producerRecord).get();
+    }
   }
 }
