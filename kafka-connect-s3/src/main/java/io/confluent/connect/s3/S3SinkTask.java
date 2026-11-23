@@ -23,7 +23,6 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
-import org.apache.kafka.connect.runtime.InternalSinkRecord;
 import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
@@ -291,16 +290,17 @@ public class S3SinkTask extends SinkTask {
       SinkRecord record,
       TopicPartition tp
   ) {
-    if (topicPartitionWriters.get(tp) == null && record instanceof InternalSinkRecord) {
-      InternalSinkRecord internal = (InternalSinkRecord) record;
-      TopicPartition source = new TopicPartition(
-          internal.originalRecord().topic(),
-          internal.originalRecord().partition()
-      );
-      if (!source.equals(tp)) {
-        TopicPartitionWriter writer = newTopicPartitionWriter(tp);
-        writer.setSourceTopicPartition(source);
-        topicPartitionWriters.put(tp, writer);
+    if (topicPartitionWriters.get(tp) == null) {
+      // Public since Kafka 3.6. The runtime-internal InternalSinkRecord changed in Kafka 4.0.
+      String originalTopic = record.originalTopic();
+      Integer originalPartition = record.originalKafkaPartition();
+      if (originalTopic != null && originalPartition != null) {
+        TopicPartition source = new TopicPartition(originalTopic, originalPartition);
+        if (!source.equals(tp)) {
+          TopicPartitionWriter writer = newTopicPartitionWriter(tp);
+          writer.setSourceTopicPartition(source);
+          topicPartitionWriters.put(tp, writer);
+        }
       }
     }
     return getTopicPartitionWriterOrThrow(tp);

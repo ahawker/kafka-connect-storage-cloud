@@ -15,12 +15,11 @@
 
 package io.confluent.connect.s3;
 
-import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
-import org.apache.kafka.connect.runtime.InternalSinkRecord;
 import org.apache.kafka.connect.sink.ErrantRecordReporter;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
@@ -313,15 +312,24 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
   private static final String UNASSIGNED_TOPIC = "unassigned-topic";
 
   // Mimics a topic-renaming SMT: record carries the new topic, original consumer record keeps the source.
+  // Public constructor the runtime itself uses to carry the pre-transform topic, partition, offset.
+  private SinkRecord sinkRecordWithOriginal(
+      String topic,
+      SinkRecord r,
+      String originalTopic,
+      int originalPartition,
+      long originalOffset
+  ) {
+    return new SinkRecord(topic, r.kafkaPartition(), r.keySchema(), r.key(), r.valueSchema(),
+        r.value(), r.kafkaOffset(), r.timestamp(), r.timestampType(), r.headers(),
+        originalTopic, originalPartition, originalOffset);
+  }
+
   private List<SinkRecord> createRenamedRecords(int size, String newTopic) {
     List<SinkRecord> renamed = new ArrayList<>();
     for (SinkRecord r : createRecordsWithPrimitive(
         size, 0, Collections.singleton(new TopicPartition(TOPIC, PARTITION)))) {
-      SinkRecord moved = new SinkRecord(newTopic, r.kafkaPartition(), r.keySchema(), r.key(),
-          r.valueSchema(), r.value(), r.kafkaOffset());
-      ConsumerRecord<byte[], byte[]> original =
-          new ConsumerRecord<>(TOPIC, PARTITION, r.kafkaOffset(), null, null);
-      renamed.add(new InternalSinkRecord(original, moved));
+      renamed.add(sinkRecordWithOriginal(newTopic, r, TOPIC, PARTITION, r.kafkaOffset()));
     }
     return renamed;
   }
@@ -389,17 +397,16 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
   }
 
   @Test
-  public void testPutUnassignedInternalRecordWithSameTopicPartitionThrows() throws Exception {
+  public void testPutUnassignedRecordWithSameOriginalTopicPartitionThrows() throws Exception {
     setUp();
     replayAll();
     startTaskWithMockContext(null);
 
     SinkRecord unassigned = new SinkRecord(UNASSIGNED_TOPIC, PARTITION, null, null,
-        Schema.INT32_SCHEMA, 1, 0);
-    ConsumerRecord<byte[], byte[]> original =
-        new ConsumerRecord<>(UNASSIGNED_TOPIC, PARTITION, 0, null, null);
+        Schema.INT32_SCHEMA, 1, 0, null, TimestampType.NO_TIMESTAMP_TYPE, null,
+        UNASSIGNED_TOPIC, PARTITION, 0L);
     try {
-      task.put(Collections.singletonList(new InternalSinkRecord(original, unassigned)));
+      task.put(Collections.singletonList(unassigned));
       fail("Expected ConnectException when original and transformed partitions match");
     } catch (ConnectException expected) {
       // Not a rename, so upstream's guard applies.
@@ -418,9 +425,9 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
     startTaskWithMockContext(reporter);
 
     SinkRecord nullValue = new SinkRecord(RENAMED_TOPIC, PARTITION, null, null,
-        Schema.OPTIONAL_STRING_SCHEMA, null, 0);
-    ConsumerRecord<byte[], byte[]> original = new ConsumerRecord<>(TOPIC, PARTITION, 0, null, null);
-    task.put(Collections.singletonList(new InternalSinkRecord(original, nullValue)));
+        Schema.OPTIONAL_STRING_SCHEMA, null, 0, null, TimestampType.NO_TIMESTAMP_TYPE, null,
+        TOPIC, PARTITION, 0L);
+    task.put(Collections.singletonList(nullValue));
     Map<TopicPartition, OffsetAndMetadata> offsets = task.preCommit(Collections.emptyMap());
     task.stop();
 
@@ -462,5 +469,24 @@ public class S3SinkTaskTest extends DataWriterAvroTest {
         Collections.singleton(new TopicPartition(TOPIC, PARTITION)),
         offsets.keySet()
     );
+  }
+
+  // Tests compile against an older Connect runtime than production, so an internal-class call
+  // that was removed later (InternalSinkRecord.originalRecord) is invisible to every other test.
+  @Test
+  public void testTaskClassesDoNotReferenceInternalConnectRuntime() throws Exception {
+    for (Class<?> c : new Class<?>[] {S3SinkTask.class, TopicPartitionWriter.class}) {
+      String resource = c.getName().replace('.', '/') + ".class";
+      java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+      try (java.io.InputStream in = c.getClassLoader().getResourceAsStream(resource)) {
+        byte[] buf = new byte[4096];
+        for (int n = in.read(buf); n >= 0; n = in.read(buf)) {
+          out.write(buf, 0, n);
+        }
+      }
+      String content = new String(out.toByteArray(), java.nio.charset.StandardCharsets.ISO_8859_1);
+      assertTrue(c.getSimpleName() + " references org.apache.kafka.connect.runtime",
+          !content.contains("org/apache/kafka/connect/runtime/"));
+    }
   }
 }
